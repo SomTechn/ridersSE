@@ -2660,6 +2660,14 @@ function App(){
         });
         // Si cambia a FINALIZADO o CANCELADO: recargar todo (afecta historial y saldo)
         if(nu.estatus==='FINALIZADO'||nu.estatus==='CANCELADO'){
+          if(nu.estatus==='CANCELADO'){
+            // Despacho canceló el pedido — sacarlo de pantalla y avisar
+            setDetalle(d=> (d && d.id===nu.id) ? null : d);
+            setPe(cur=> (cur && cur.id===nu.id) ? null : cur);
+            detenerAlarma();
+            toast('⚠️ Despacho canceló este pedido');
+            sonarEstadoAvanzado();
+          }
           cargarDatos(delId);
         }
         // Si despacho aprobó la factura: toast al rider
