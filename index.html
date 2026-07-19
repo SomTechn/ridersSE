@@ -2514,6 +2514,7 @@ function App(){
     setTurno(turnoActual);
     turnoRef.current = turnoActual;
     cargarDatos(del.id);
+    chequearAsignacionPendiente(del.id);
     iniciarGPS(del.id);
     suscribirRealtime(del.id);
     cargarConfigSistema();
@@ -2549,6 +2550,25 @@ function App(){
     const iv=setInterval(refrescarCola,5000);
     return ()=>{ window.removeEventListener('online',on); window.removeEventListener('offline',off); window.removeEventListener('off:cambio',refrescarCola); clearInterval(iv); };
   },[delivery?.id]);
+
+  // ── Cold-start: si el rider fue asignado mientras estaba fuera de la app,
+  //    mostrar el pedido entrante + alarma al abrir. Muestra aunque haya expirado
+  //    (>30s) para que el rider decida aceptar o rechazar.
+  const chequearAsignacionPendiente=async(delId)=>{
+    if(!offOnline()) return;                 // sin señal: Realtime lo levantará al reconectar
+    try{
+      const {data,error}=await sb.rpc('asignacion_pendiente_rider');
+      if(error){ console.warn('[coldstart] asignacion_pendiente_rider:',error.message); return; }
+      if(!data?.ok || !data?.hay) return;
+      const {data:ped}=await sb.from('pedidos').select('*').eq('id',data.pedido_id).single();
+      if(!ped) return;
+      const peNorm=normalizarPedido(ped,data.asg_id);
+      setPe(peNorm);
+      const suf = data.expirada ? ' (venció — decide)' : '';
+      notifLocal('🔔 Nuevo Pedido'+suf,(ped.nombre_comercio||'—')+' · '+(ped.ciudad_destino||''));
+      iniciarAlarma();
+    }catch(e){ console.warn('[coldstart] error:',e.message); }
+  };
 
   const cargarDatos=async(delId)=>{
     const ACTIVOS=['ASIGNADO','ACEPTADO','EN_ESTABLECIMIENTO','PEDIDO_EN_CAMINO','ENTREGANDO'];
