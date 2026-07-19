@@ -2734,9 +2734,12 @@ function App(){
       // ── Asignación expirada o cancelada → limpiar pedido entrante ──
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'asignaciones_pendientes',filter:'delivery_id=eq.'+delId},p=>{
         const est=p.new?.estatus;
-        if(est==='EXPIRADO'||est==='CANCELADO'){
-          detenerAlarma();
-          setPe(null);
+        if(est==='EXPIRADO'||est==='CANCELADO'||est==='RECHAZADO'){
+          // Solo limpiar si es la asignación que el rider tiene en pantalla
+          setPe(cur=>{
+            if(cur && cur._asigId===p.new.id){ detenerAlarma(); return null; }
+            return cur;
+          });
           cargarDatos(delId);
         }
       })
@@ -2968,13 +2971,10 @@ function App(){
 
   const rechazarPE=async()=>{
     detenerAlarma();
-    if(pe?._asigId) await sb.from('asignaciones_pendientes')
-      .update({estatus:'RECHAZADO',respondido_at:new Date().toISOString()})
-      .eq('id',pe._asigId);
-    if(pe?.id) await sb.from('pedidos')
-      .update({estatus:'PENDIENTE',delivery_id:null})
-      .eq('id',pe.id)
-      .eq('delivery_id',delivery.id);
+    if(pe?._asigId){
+      const {error}=await sb.rpc('rider_rechazar_pedido',{p_asg_id:pe._asigId});
+      if(error) console.warn('[rechazar] rpc:',error.message);
+    }
     setPe(null);toast('Pedido rechazado');
   };
 
