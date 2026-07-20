@@ -1042,6 +1042,44 @@ function ModoSolToggle(){
 
 // ─── VISTA DETALLE DEL PEDIDO ─────────────────────────────
 // El botón de acción principal es un FAB sticky en la esquina inferior izquierda
+// ─── DOC DE PEDIDO (QR acceso / ticket comercio, bucket privado) ──
+// Firma el path de pedidos-docs y lo muestra. Maneja carga y errores
+// (por ejemplo si Despacho ya eliminó la imagen tras finalizar).
+function DocPedido({ path, titulo, nota, color }){
+  const [url, setUrl] = React.useState(null);
+  const [estado, setEstado] = React.useState('cargando'); // cargando|ok|error
+
+  React.useEffect(()=>{
+    let vivo = true;
+    if(!path){ setEstado('error'); return; }
+    (async ()=>{
+      try{
+        const { data, error } = await sb.storage.from('pedidos-docs').createSignedUrl(path, 60*60*6);
+        if(!vivo) return;
+        if(error || !data?.signedUrl){ setEstado('error'); return; }
+        setUrl(data.signedUrl); setEstado('ok');
+      }catch(e){ if(vivo) setEstado('error'); }
+    })();
+    return ()=>{ vivo=false; };
+  },[path]);
+
+  if(estado==='error') return null; // sin imagen disponible: no mostrar nada
+
+  return (
+    <div style={{padding:'14px',borderBottom:'1px solid #222'}}>
+      <div style={{fontSize:10,fontWeight:700,color:color||'#FF8C00',textTransform:'uppercase',letterSpacing:'.07em',marginBottom:10}}>{titulo}</div>
+      {nota && <div style={{fontSize:13,color:'#F0F0F0',background:'rgba(255,140,0,.08)',border:'1px solid rgba(255,140,0,.2)',borderRadius:10,padding:'10px 12px',marginBottom:10,lineHeight:1.5}}>📝 {nota}</div>}
+      <div onClick={()=>url&&window.open(url,'_blank')}
+        style={{background:'#1A1A1A',borderRadius:12,border:'1px solid #333',overflow:'hidden',cursor:url?'pointer':'default',minHeight:120,display:'flex',alignItems:'center',justifyContent:'center'}}>
+        {estado==='cargando'
+          ? <div style={{color:'#888',fontSize:13,padding:24}}>Cargando imagen…</div>
+          : <img src={url} alt={titulo} style={{width:'100%',maxHeight:360,objectFit:'contain',display:'block'}}/>}
+      </div>
+      {url && <div style={{fontSize:11,color:'#555',textAlign:'center',marginTop:6}}>Toca la imagen para ampliarla</div>}
+    </div>
+  );
+}
+
 function VistaPedido({p, pedidos, onAvanzar, onBack, onConfirm, toast, ahora}){
   const [facMonto, setFacMonto] = useState('');
   const [facFile, setFacFile] = useState(null);
@@ -1184,6 +1222,11 @@ function VistaPedido({p, pedidos, onAvanzar, onBack, onConfirm, toast, ahora}){
           </div>
         )}
 
+        {/* Ticket del comercio — siempre visible en el detalle (para recoger) */}
+        {pedidoActual.ticket_comercio_path && (
+          <DocPedido path={pedidoActual.ticket_comercio_path} titulo="🎫 Ticket del Comercio" color="#F59E0B"/>
+        )}
+
         {/* Sección PRODUCTOS DEL PEDIDO */}
         {pedidoActual.detalle_json && pedidoActual.detalle_json.items && pedidoActual.detalle_json.items.length > 0 && (
           <div style={{padding:'14px',borderBottom:'1px solid #222'}}>
@@ -1274,6 +1317,15 @@ function VistaPedido({p, pedidos, onAvanzar, onBack, onConfirm, toast, ahora}){
               </div>
             </div>
           </div>
+        )}
+
+        {/* QR de acceso — aparece al ir en camino / entregando (para entrar a entregar) */}
+        {enRuta && pedidoActual.qr_acceso_path && (
+          <DocPedido
+            path={pedidoActual.qr_acceso_path}
+            titulo="🔑 QR / Código de Acceso"
+            nota={pedidoActual.qr_acceso_nota}
+            color="#22C55E"/>
         )}
 
         {/* Sección ENTREGA */}
@@ -2080,9 +2132,10 @@ function AuthScreen({onLogin}){
 
 // ─── CHAT ─────────────────────────────────────────────────
 function TabChat({delivery, chatUnread, setChatUnread}){
+  const [abierto,setAbierto]   = useState(false);
   const [msgs,setMsgs]         = useState([]);
   const [texto,setTexto]       = useState('');
-  const [cargando,setCargando] = useState(true);
+  const [cargando,setCargando] = useState(false);
   const [enviando,setEnviando] = useState(false);
   const [imgFile,setImgFile]   = useState(null);
   const [imgPreview,setImgPreview] = useState(null);
@@ -2090,9 +2143,9 @@ function TabChat({delivery, chatUnread, setChatUnread}){
   const chRef   = useRef(null);
   const inputRef = useRef(null);
 
-  // Cargar mensajes y suscribirse al montar el tab (la conversación es la vista por defecto)
+  // Cargar mensajes y suscribirse al abrir la conversación
   useEffect(()=>{
-    if(!delivery?.id) return;
+    if(!abierto || !delivery?.id) return;
     setCargando(true);
     sb.from('chat_mensajes')
       .select('*').eq('delivery_id',delivery.id)
@@ -2107,20 +2160,26 @@ function TabChat({delivery, chatUnread, setChatUnread}){
     chRef.current = sb.channel('chat_rider_'+delivery.id)
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'chat_mensajes',
         filter:'delivery_id=eq.'+delivery.id}, p=>{
-        setMsgs(ms=> ms.some(x=>x.id===p.new.id) ? ms : [...ms,p.new]);
-        if(p.new.remitente==='DESPACHO'){
+        setMsgs(ms=>[...ms,p.new]);
+        if(p.new.remitente==='DESPACHO')
           sb.from('chat_mensajes').update({leido:true,leido_at:new Date().toISOString()}).eq('id',p.new.id);
-          if(setChatUnread) setChatUnread(0);   // ya está viendo el chat
-          sonarMensaje();                        // aviso suave, sin badge
-        }
       }).subscribe();
     return ()=>{ if(chRef.current){ sb.removeChannel(chRef.current); chRef.current=null; } };
-  },[delivery?.id]);
+  },[abierto, delivery?.id]);
 
   // Scroll al fondo al llegar mensajes
   useEffect(()=>{
     if(listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   },[msgs]);
+
+  // Bloquear scroll del body cuando chat está abierto
+  useEffect(()=>{
+    document.body.style.overflow = abierto ? 'hidden' : '';
+    return ()=>{ document.body.style.overflow = ''; };
+  },[abierto]);
+
+  const abrir = () => setAbierto(true);
+  const cerrar = () => { setAbierto(false); setMsgs([]); setTexto(''); };
 
   const enviar = async () => {
     const msg = texto.trim();
@@ -2157,115 +2216,169 @@ function TabChat({delivery, chatUnread, setChatUnread}){
     setTimeout(()=>inputRef.current?.focus(),100);
   };
 
-  return(
-    <div style={{position:'fixed',left:0,right:0,top:0,bottom:'calc(env(safe-area-inset-bottom) + 64px)',
-      background:'var(--bg)',display:'flex',flexDirection:'column',zIndex:50}}>
+  const ultimo = msgs[msgs.length-1];
+  const ultimaHora = ultimo
+    ? new Date(ultimo.created_at).toLocaleTimeString('es-HN',{hour:'2-digit',minute:'2-digit',timeZone:'America/Tegucigalpa'})
+    : null;
 
-      {/* Header */}
-      <div style={{background:'var(--s1)',borderBottom:'1px solid var(--brd)',
-        padding:'10px 14px',display:'flex',alignItems:'center',gap:12,
-        flexShrink:0,paddingTop:'max(10px, env(safe-area-inset-top))'}}>
-        <div style={{width:38,height:38,borderRadius:12,background:'var(--brand)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#000" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/>
-          </svg>
+  return(
+    <>
+      {/* ── LISTADO (pantalla principal del tab) ── */}
+      <div style={{paddingBottom:8}}>
+        <div style={{fontSize:11,fontWeight:600,color:'var(--txt3)',textTransform:'uppercase',letterSpacing:'.08em',padding:'16px 16px 10px'}}>
+          Mensajes
         </div>
-        <div style={{flex:1}}>
-          <div style={{fontSize:15,fontWeight:700,color:'var(--txt)'}}>Despacho Somar Express</div>
-          <div style={{fontSize:11,color:'var(--green)',display:'flex',alignItems:'center',gap:4}}>
-            <div style={{width:6,height:6,borderRadius:'50%',background:'var(--green)',animation:'pulse 2s infinite'}}/>
-            En línea
+        {/* Card de conversación con Despacho */}
+        <button onClick={abrir}
+          style={{width:'100%',display:'flex',alignItems:'center',gap:14,padding:'14px 16px',
+            background:'none',border:'none',borderBottom:'1px solid var(--brd)',cursor:'pointer',textAlign:'left'}}>
+          <div style={{position:'relative',flexShrink:0}}>
+            <div style={{width:52,height:52,borderRadius:16,background:'var(--brand)',display:'flex',alignItems:'center',justifyContent:'center'}}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#000" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/>
+              </svg>
+            </div>
+            {chatUnread>0&&(
+              <div style={{position:'absolute',top:-4,right:-4,width:18,height:18,background:'var(--red)',borderRadius:'50%',fontSize:10,fontWeight:800,color:'#fff',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                {chatUnread>9?'9+':chatUnread}
+              </div>
+            )}
           </div>
-        </div>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:15,fontWeight:700,color:'var(--txt)',marginBottom:3}}>Despacho Somar Express</div>
+            <div style={{fontSize:13,color:'var(--txt3)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+              {ultimo
+                ? (ultimo.remitente==='DELIVERY'?'Tú: ':'')+( ultimo.mensaje||'📷 Imagen')
+                : 'Escríbele a Despacho'}
+            </div>
+          </div>
+          <div style={{flexShrink:0,textAlign:'right'}}>
+            {ultimaHora&&<div style={{fontSize:11,color:'var(--txt3)',marginBottom:4}}>{ultimaHora}</div>}
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--txt3)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 18l6-6-6-6"/>
+            </svg>
+          </div>
+        </button>
       </div>
 
-      {/* Mensajes */}
-      <div ref={listRef}
-        style={{flex:1,overflowY:'auto',overflowX:'hidden',padding:'12px 14px',
-          display:'flex',flexDirection:'column',gap:8,WebkitOverflowScrolling:'touch'}}>
-        {cargando&&<div style={{textAlign:'center',color:'var(--txt3)',padding:30}}>Cargando...</div>}
-        {!cargando&&msgs.length===0&&(
-          <div style={{textAlign:'center',padding:'60px 24px',color:'var(--txt3)'}}>
-            <div style={{fontSize:14}}>Escríbele a Despacho aquí</div>
-          </div>
-        )}
-        {msgs.map(m=>{
-          const mio = m.remitente==='DELIVERY';
-          const agente = m.remitente_nombre;
-          const COLORES=['#FF8C00','#3B82F6','#8B5CF6','#EC4899','#14B8A6','#F59E0B'];
-          const colorIdx = agente ? Math.abs(agente.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0))%COLORES.length : 0;
-          const aColor = COLORES[colorIdx];
-          const hora = new Date(m.created_at).toLocaleTimeString('es-HN',{hour:'2-digit',minute:'2-digit',timeZone:'America/Tegucigalpa'});
-          return(
-            <div key={m.id} style={{display:'flex',justifyContent:mio?'flex-end':'flex-start',marginBottom:2}}>
-              {!mio&&(
-                <div style={{width:28,height:28,background:aColor,borderRadius:8,display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,flexShrink:0,marginRight:8,alignSelf:'flex-end',color:'#fff'}}>
-                  {agente?agente.charAt(0).toUpperCase():'D'}
-                </div>
-              )}
-              <div style={{maxWidth:'75%'}}>
-                {!mio&&agente&&<div style={{fontSize:10,fontWeight:700,color:aColor,marginBottom:2,paddingLeft:2}}>{agente}</div>}
-                <div style={{background:mio?'var(--brand)':'var(--s2)',color:mio?'#000':'var(--txt)',
-                  borderRadius:mio?'18px 18px 4px 18px':'18px 18px 18px 4px',
-                  padding:'10px 14px',fontSize:14,lineHeight:1.5,
-                  ...(mio?{}:{borderLeft:`2px solid ${aColor}`})}}>
-                  {m.mensaje&&<div>{m.mensaje}</div>}
-                  {m.imagen_url&&(
-                    <img src={m.imagen_url} onClick={()=>window.open(m.imagen_url)}
-                      style={{maxWidth:'220px',maxHeight:'200px',borderRadius:10,display:'block',
-                        marginTop:m.mensaje?8:0,cursor:'pointer',objectFit:'cover'}} loading="lazy"/>
-                  )}
-                </div>
-                <div style={{fontSize:10,color:'var(--txt3)',marginTop:3,textAlign:mio?'right':'left'}}>
-                  {hora}{mio&&<span style={{marginLeft:4}}>{m.leido?'✓✓':'✓'}</span>}
-                </div>
+      {/* ── CONVERSACIÓN (overlay fullscreen estilo WhatsApp) ── */}
+      {abierto&&(
+        <div style={{position:'fixed',inset:0,zIndex:200,background:'var(--bg)',display:'flex',flexDirection:'column'}}>
+
+          {/* Header */}
+          <div style={{background:'var(--s1)',borderBottom:'1px solid var(--brd)',
+            padding:'10px 14px',display:'flex',alignItems:'center',gap:12,
+            flexShrink:0,paddingTop:'max(10px, env(safe-area-inset-top))'}}>
+            <button onClick={cerrar}
+              style={{background:'none',border:'none',color:'var(--txt)',padding:4,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M19 12H5M12 5l-7 7 7 7"/>
+              </svg>
+            </button>
+            <div style={{width:38,height:38,borderRadius:12,background:'var(--brand)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#000" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/>
+              </svg>
+            </div>
+            <div style={{flex:1}}>
+              <div style={{fontSize:15,fontWeight:700,color:'var(--txt)'}}>Despacho Somar Express</div>
+              <div style={{fontSize:11,color:'var(--green)',display:'flex',alignItems:'center',gap:4}}>
+                <div style={{width:6,height:6,borderRadius:'50%',background:'var(--green)',animation:'pulse 2s infinite'}}/>
+                En línea
               </div>
             </div>
-          );
-        })}
-      </div>
-
-      {/* Input */}
-      <div style={{background:'var(--s1)',borderTop:'1px solid var(--brd)',
-        padding:'8px 12px',flexShrink:0}}>
-        {imgPreview&&(
-          <div style={{position:'relative',display:'inline-block',marginBottom:8}}>
-            <img src={imgPreview} style={{height:64,borderRadius:10,objectFit:'cover'}}/>
-            <button onClick={()=>{setImgFile(null);setImgPreview(null);}}
-              style={{position:'absolute',top:-6,right:-6,width:20,height:20,borderRadius:'50%',
-                background:'var(--red)',border:'none',color:'#fff',fontSize:12,cursor:'pointer',
-                display:'flex',alignItems:'center',justifyContent:'center'}}>✕</button>
           </div>
-        )}
-        <div style={{display:'flex',gap:8,alignItems:'flex-end'}}>
-          <button onClick={()=>document.getElementById('chat-img-rider').click()}
-            style={{width:40,height:40,borderRadius:12,background:'var(--s3)',border:'1px solid var(--brd)',
-              color:'var(--txt3)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,cursor:'pointer'}}>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
-            </svg>
-          </button>
-          <input type="file" id="chat-img-rider" accept="image/*" style={{display:'none'}}
-            onChange={e=>{const f=e.target.files[0];if(f){setImgFile(f);const r=new FileReader();r.onload=ev=>setImgPreview(ev.target.result);r.readAsDataURL(f);}e.target.value='';}}/>
-          <input ref={inputRef} value={texto} onChange={e=>setTexto(e.target.value)}
-            onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();enviar();}}}
-            placeholder="Escribe un mensaje..."
-            style={{flex:1,background:'var(--s3)',border:'1px solid var(--brd)',borderRadius:24,
-              padding:'11px 16px',color:'var(--txt)',fontSize:14,outline:'none',
-              fontFamily:'inherit',lineHeight:1.4}}/>
-          <button onClick={enviar} disabled={(!texto.trim()&&!imgFile)||enviando}
-            style={{width:44,height:44,borderRadius:'50%',flexShrink:0,
-              background:(texto.trim()||imgFile)?'var(--brand)':'var(--s3)',
-              border:'none',color:(texto.trim()||imgFile)?'#000':'var(--txt3)',
-              display:'flex',alignItems:'center',justifyContent:'center',transition:'all .15s'}}>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-            </svg>
-          </button>
-        </div>
-      </div>
 
-    </div>
+          {/* Mensajes */}
+          <div ref={listRef}
+            style={{flex:1,overflowY:'auto',overflowX:'hidden',padding:'12px 14px',
+              display:'flex',flexDirection:'column',gap:8,WebkitOverflowScrolling:'touch'}}>
+            {cargando&&<div style={{textAlign:'center',color:'var(--txt3)',padding:30}}>Cargando...</div>}
+            {!cargando&&msgs.length===0&&(
+              <div style={{textAlign:'center',padding:'60px 24px',color:'var(--txt3)'}}>
+                <div style={{fontSize:14}}>Escríbele a Despacho aquí</div>
+              </div>
+            )}
+            {msgs.map(m=>{
+              const mio = m.remitente==='DELIVERY';
+              const agente = m.remitente_nombre;
+              const COLORES=['#FF8C00','#3B82F6','#8B5CF6','#EC4899','#14B8A6','#F59E0B'];
+              const colorIdx = agente ? Math.abs(agente.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0))%COLORES.length : 0;
+              const aColor = COLORES[colorIdx];
+              const hora = new Date(m.created_at).toLocaleTimeString('es-HN',{hour:'2-digit',minute:'2-digit',timeZone:'America/Tegucigalpa'});
+              return(
+                <div key={m.id} style={{display:'flex',justifyContent:mio?'flex-end':'flex-start',marginBottom:2}}>
+                  {!mio&&(
+                    <div style={{width:28,height:28,background:aColor,borderRadius:8,display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,flexShrink:0,marginRight:8,alignSelf:'flex-end',color:'#fff'}}>
+                      {agente?agente.charAt(0).toUpperCase():'D'}
+                    </div>
+                  )}
+                  <div style={{maxWidth:'75%'}}>
+                    {!mio&&agente&&<div style={{fontSize:10,fontWeight:700,color:aColor,marginBottom:2,paddingLeft:2}}>{agente}</div>}
+                    <div style={{background:mio?'var(--brand)':'var(--s2)',color:mio?'#000':'var(--txt)',
+                      borderRadius:mio?'18px 18px 4px 18px':'18px 18px 18px 4px',
+                      padding:'10px 14px',fontSize:14,lineHeight:1.5,
+                      ...(mio?{}:{borderLeft:`2px solid ${aColor}`})}}>
+                      {m.mensaje&&<div>{m.mensaje}</div>}
+                      {m.imagen_url&&(
+                        <img src={m.imagen_url} onClick={()=>window.open(m.imagen_url)}
+                          style={{maxWidth:'220px',maxHeight:'200px',borderRadius:10,display:'block',
+                            marginTop:m.mensaje?8:0,cursor:'pointer',objectFit:'cover'}} loading="lazy"/>
+                      )}
+                    </div>
+                    <div style={{fontSize:10,color:'var(--txt3)',marginTop:3,textAlign:mio?'right':'left'}}>
+                      {hora}{mio&&<span style={{marginLeft:4}}>{m.leido?'✓✓':'✓'}</span>}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Input */}
+          <div style={{background:'var(--s1)',borderTop:'1px solid var(--brd)',
+            padding:'8px 12px',flexShrink:0,
+            paddingBottom:'max(8px, env(safe-area-inset-bottom))'}}>
+            {imgPreview&&(
+              <div style={{position:'relative',display:'inline-block',marginBottom:8}}>
+                <img src={imgPreview} style={{height:64,borderRadius:10,objectFit:'cover'}}/>
+                <button onClick={()=>{setImgFile(null);setImgPreview(null);}}
+                  style={{position:'absolute',top:-6,right:-6,width:20,height:20,borderRadius:'50%',
+                    background:'var(--red)',border:'none',color:'#fff',fontSize:12,cursor:'pointer',
+                    display:'flex',alignItems:'center',justifyContent:'center'}}>✕</button>
+              </div>
+            )}
+            <div style={{display:'flex',gap:8,alignItems:'flex-end'}}>
+              <button onClick={()=>document.getElementById('chat-img-rider').click()}
+                style={{width:40,height:40,borderRadius:12,background:'var(--s3)',border:'1px solid var(--brd)',
+                  color:'var(--txt3)',display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0,cursor:'pointer'}}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+              </button>
+              <input type="file" id="chat-img-rider" accept="image/*" style={{display:'none'}}
+                onChange={e=>{const f=e.target.files[0];if(f){setImgFile(f);const r=new FileReader();r.onload=ev=>setImgPreview(ev.target.result);r.readAsDataURL(f);}e.target.value='';}}/>
+              <input ref={inputRef} value={texto} onChange={e=>setTexto(e.target.value)}
+                onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();enviar();}}}
+                placeholder="Escribe un mensaje..."
+                style={{flex:1,background:'var(--s3)',border:'1px solid var(--brd)',borderRadius:24,
+                  padding:'11px 16px',color:'var(--txt)',fontSize:14,outline:'none',
+                  fontFamily:'inherit',lineHeight:1.4}}/>
+              <button onClick={enviar} disabled={(!texto.trim()&&!imgFile)||enviando}
+                style={{width:44,height:44,borderRadius:'50%',flexShrink:0,
+                  background:(texto.trim()||imgFile)?'var(--brand)':'var(--s3)',
+                  border:'none',color:(texto.trim()||imgFile)?'#000':'var(--txt3)',
+                  display:'flex',alignItems:'center',justifyContent:'center',transition:'all .15s'}}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+        </div>
+      )}
+    </>
   );
 }
 
@@ -2328,8 +2441,6 @@ function App(){
   const [delivery,setDelivery]=useState(null);
   // ── UI ────────────────────────────────────────────────
   const [tab,setTab]=useState('asignados');
-  const tabRef=useRef('asignados');
-  useEffect(()=>{ tabRef.current=tab; },[tab]);
   const [sideOpen,setSideOpen]=useState(false);
   const [detalle,setDetalle]=useState(null);
   const [sheet,setSheet]=useState(null);
@@ -2455,7 +2566,6 @@ function App(){
     setTurno(turnoActual);
     turnoRef.current = turnoActual;
     cargarDatos(del.id);
-    chequearAsignacionPendiente(del.id);
     iniciarGPS(del.id);
     suscribirRealtime(del.id);
     cargarConfigSistema();
@@ -2489,32 +2599,8 @@ function App(){
     window.addEventListener('offline',off);
     window.addEventListener('off:cambio',refrescarCola);
     const iv=setInterval(refrescarCola,5000);
-    // Poll de respaldo: si no hay pedido en pantalla, reconsultar asignación pendiente
-    // (mantiene visible una MANUAL aunque se pierda el evento Realtime o la app estuviera en segundo plano).
-    const ivAsig=setInterval(()=>{
-      if(delivery?.id) setPe(cur=>{ if(!cur) chequearAsignacionPendiente(delivery.id); return cur; });
-    },20000);
-    return ()=>{ window.removeEventListener('online',on); window.removeEventListener('offline',off); window.removeEventListener('off:cambio',refrescarCola); clearInterval(iv); clearInterval(ivAsig); };
+    return ()=>{ window.removeEventListener('online',on); window.removeEventListener('offline',off); window.removeEventListener('off:cambio',refrescarCola); clearInterval(iv); };
   },[delivery?.id]);
-
-  // ── Cold-start: si el rider fue asignado mientras estaba fuera de la app,
-  //    mostrar el pedido entrante + alarma al abrir. Muestra aunque haya expirado
-  //    (>30s) para que el rider decida aceptar o rechazar.
-  const chequearAsignacionPendiente=async(delId)=>{
-    if(!offOnline()) return;                 // sin señal: Realtime lo levantará al reconectar
-    try{
-      const {data,error}=await sb.rpc('asignacion_pendiente_rider');
-      if(error){ console.warn('[coldstart] asignacion_pendiente_rider:',error.message); return; }
-      if(!data?.ok || !data?.hay) return;
-      const {data:ped}=await sb.from('pedidos').select('*').eq('id',data.pedido_id).single();
-      if(!ped) return;
-      const peNorm=normalizarPedido(ped,data.asg_id);
-      setPe(peNorm);
-      const suf = data.expirada ? ' (venció — decide)' : '';
-      notifLocal('🔔 Nuevo Pedido'+suf,(ped.nombre_comercio||'—')+' · '+(ped.ciudad_destino||''));
-      iniciarAlarma();
-    }catch(e){ console.warn('[coldstart] error:',e.message); }
-  };
 
   const cargarDatos=async(delId)=>{
     const ACTIVOS=['ASIGNADO','ACEPTADO','EN_ESTABLECIMIENTO','PEDIDO_EN_CAMINO','ENTREGANDO'];
@@ -2660,14 +2746,6 @@ function App(){
         });
         // Si cambia a FINALIZADO o CANCELADO: recargar todo (afecta historial y saldo)
         if(nu.estatus==='FINALIZADO'||nu.estatus==='CANCELADO'){
-          if(nu.estatus==='CANCELADO'){
-            // Despacho canceló el pedido — sacarlo de pantalla y avisar
-            setDetalle(d=> (d && d.id===nu.id) ? null : d);
-            setPe(cur=> (cur && cur.id===nu.id) ? null : cur);
-            detenerAlarma();
-            toast('⚠️ Despacho canceló este pedido');
-            sonarEstadoAvanzado();
-          }
           cargarDatos(delId);
         }
         // Si despacho aprobó la factura: toast al rider
@@ -2680,22 +2758,17 @@ function App(){
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'depositos_delivery',filter:'delivery_id=eq.'+delId},p=>{ cargarDatos(delId); if(p.new?.estatus==='APROBADO') sonarDepositoAprobado(); })
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'chat_mensajes',filter:'delivery_id=eq.'+delId},p=>{
         if(p.new.remitente==='DESPACHO'){
-          // Si el rider ya está viendo el chat, no cuenta como no leído ni molesta con sonido
-          if(tabRef.current==='chat') return;
           setChatUnread(n=>n+1);
-          notifLocal('💬 Despacho',p.new.mensaje||'📷 Imagen');
+          notifLocal('💬 Despacho',p.new.mensaje);
           sonarMensaje();
         }
       })
       // ── Asignación expirada o cancelada → limpiar pedido entrante ──
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'asignaciones_pendientes',filter:'delivery_id=eq.'+delId},p=>{
         const est=p.new?.estatus;
-        if(est==='EXPIRADO'||est==='CANCELADO'||est==='RECHAZADO'){
-          // Solo limpiar si es la asignación que el rider tiene en pantalla
-          setPe(cur=>{
-            if(cur && cur._asigId===p.new.id){ detenerAlarma(); return null; }
-            return cur;
-          });
+        if(est==='EXPIRADO'||est==='CANCELADO'){
+          detenerAlarma();
+          setPe(null);
           cargarDatos(delId);
         }
       })
@@ -2927,10 +3000,13 @@ function App(){
 
   const rechazarPE=async()=>{
     detenerAlarma();
-    if(pe?._asigId){
-      const {error}=await sb.rpc('rider_rechazar_pedido',{p_asg_id:pe._asigId});
-      if(error) console.warn('[rechazar] rpc:',error.message);
-    }
+    if(pe?._asigId) await sb.from('asignaciones_pendientes')
+      .update({estatus:'RECHAZADO',respondido_at:new Date().toISOString()})
+      .eq('id',pe._asigId);
+    if(pe?.id) await sb.from('pedidos')
+      .update({estatus:'PENDIENTE',delivery_id:null})
+      .eq('id',pe.id)
+      .eq('delivery_id',delivery.id);
     setPe(null);toast('Pedido rechazado');
   };
 
@@ -3216,7 +3292,7 @@ function App(){
               {t.badge>0&&(
                 <div style={{position:'absolute',top:6,right:'calc(50% - 18px)',background:'var(--red)',color:'#fff',
                   borderRadius:10,fontSize:9,fontWeight:800,padding:'1px 5px',minWidth:16,textAlign:'center',lineHeight:'14px'}}>
-                  {t.badge>9?'9+':t.badge}
+                  {t.badge}
                 </div>
               )}
               {active&&<div style={{position:'absolute',bottom:0,left:'50%',transform:'translateX(-50%)',width:20,height:2,background:'var(--brand)',borderRadius:2}}/>}
