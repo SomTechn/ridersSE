@@ -519,22 +519,71 @@ async function cargarConfigSistema() {
 }
 
 // ── PWA: SW + notificaciones ──────────────────────────────
+const ICONO_SOMAR = 'https://res.cloudinary.com/drkaxsziu/image/upload/v1767871213/Somar_Express_2048_x_2048_px_18_x_18_in__20250623_221102_0000_o0bv7a.png';
+let SW_REG = null;
+let SONIDO_ON = localStorage.getItem('somar_sonido') !== '0';
+
 if('serviceWorker' in navigator) {
   window.addEventListener('load', () =>
-    navigator.serviceWorker.register('./delivery-sw.js').catch(e=>console.warn('[SW]',e))
+    navigator.serviceWorker.register('./delivery-sw.js')
+      .then(reg => { SW_REG = reg; })
+      .catch(e => console.warn('[SW]', e))
   );
 }
-if('Notification' in window && Notification.permission==='default') {
-  Notification.requestPermission();
+
+function pedirPermisoNotif() {
+  if(!('Notification' in window)) return Promise.resolve('unsupported');
+  if(Notification.permission === 'default') return Notification.requestPermission();
+  return Promise.resolve(Notification.permission);
 }
-const notifLocal = (titulo, cuerpo) => {
-  if(Notification.permission!=='granted') return;
-  new Notification(titulo, {
-    body: cuerpo,
-    icon: 'https://res.cloudinary.com/drkaxsziu/image/upload/v1767871213/Somar_Express_2048_x_2048_px_18_x_18_in__20250623_221102_0000_o0bv7a.png',
+// Chrome en Android ignora el prompt sin gesto del usuario: reintentamos al primer toque
+if('Notification' in window && Notification.permission === 'default') {
+  const _pedirUnaVez = () => {
+    pedirPermisoNotif();
+    ['pointerdown','touchend','click'].forEach(ev => document.removeEventListener(ev, _pedirUnaVez));
+  };
+  ['pointerdown','touchend','click'].forEach(ev => document.addEventListener(ev, _pedirUnaVez, {passive:true}));
+}
+
+// Android EXIGE ServiceWorkerRegistration.showNotification().
+// new Notification() lanza "Illegal constructor" y no muestra nada.
+const notifLocal = async (titulo, cuerpo, data) => {
+  if(!('Notification' in window) || Notification.permission !== 'granted') return;
+  const ops = {
+    body: cuerpo || '',
+    icon: ICONO_SOMAR,
+    badge: ICONO_SOMAR,
     vibrate: [200,100,200],
-  });
+    tag: 'somar-' + ((data && data.notif_id) || Date.now()),
+    renotify: true,
+    requireInteraction: !!(data && data.urgente),
+    data: data || {},
+  };
+  try {
+    const reg = SW_REG || (navigator.serviceWorker && await navigator.serviceWorker.getRegistration());
+    if(reg && reg.showNotification) { reg.showNotification(titulo, ops); return; }
+  } catch(e) {}
+  try { new Notification(titulo, ops); } catch(e) {}
 };
+
+function toggleSonido() {
+  SONIDO_ON = !SONIDO_ON;
+  localStorage.setItem('somar_sonido', SONIDO_ON ? '1' : '0');
+  return SONIDO_ON;
+}
+
+// Sonido segun el tipo de notificacion. NUEVO_PEDIDO se omite:
+// esa la maneja iniciarAlarma(), que se repite hasta aceptar o rechazar.
+function sonarNotifRider(nt) {
+  if(!SONIDO_ON) return;
+  switch(nt.tipo) {
+    case 'NUEVO_PEDIDO': return;
+    case 'CHAT':         return sonarMensaje();
+    case 'DEPOSITO':
+    case 'LIQUIDACION':  return sonarDepositoAprobado();
+    default:             return sonarEstadoAvanzado();
+  }
+}
 
 // ── Instalar PWA ──────────────────────────────────────────
 let _deferredInstall = null;
@@ -2455,6 +2504,7 @@ function App(){
   const [saldo,setSaldo]=useState(0);
   const [notifs,setNotifs]=useState([]);
   const [showNotifs,setShowNotifs]=useState(false);
+  const [sonidoOn,setSonidoOn]=useState(SONIDO_ON);
   const [turno,setTurno]=useState(false);
   const [pausado,setPausado]=useState(false);
   const [pe,setPe]=useState(null);
@@ -2731,7 +2781,7 @@ function App(){
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'asignaciones_pendientes',filter:'delivery_id=eq.'+delId},async p=>{
         if(p.new.estatus!=='ENVIADO')return;
         const {data:ped}=await sb.from('pedidos').select('*').eq('id',p.new.pedido_id).single();
-        if(ped){const peNorm=normalizarPedido(ped,p.new.id);setPe(peNorm);notifLocal('🔔 Nuevo Pedido',(ped.nombre_comercio||'—')+' · '+(ped.ciudad_destino||''));iniciarAlarma();}
+        if(ped){const peNorm=normalizarPedido(ped,p.new.id);setPe(peNorm);iniciarAlarma();}
       })
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'pedidos',filter:'delivery_id=eq.'+delId},p=>{
         const nu = p.new;
@@ -2759,8 +2809,6 @@ function App(){
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'chat_mensajes',filter:'delivery_id=eq.'+delId},p=>{
         if(p.new.remitente==='DESPACHO'){
           setChatUnread(n=>n+1);
-          notifLocal('💬 Despacho',p.new.mensaje);
-          sonarMensaje();
         }
       })
       // ── Asignación expirada o cancelada → limpiar pedido entrante ──
@@ -2775,13 +2823,16 @@ function App(){
       // ── Notificaciones del sistema en tiempo real ──
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'notificaciones_delivery',filter:'delivery_id=eq.'+delId},p=>{
         setNotifs(prev=>[p.new,...prev]);
-        sonarMensaje();
-        notifLocal(p.new.titulo||'🔔 Somar Express',p.new.cuerpo||'');
+        sonarNotifRider(p.new);
+        notifLocal(
+          (p.new.icono?p.new.icono+' ':'')+(p.new.titulo||'Somar Express'),
+          p.new.cuerpo||'',
+          Object.assign({}, p.new.data||{}, {notif_id:p.new.id, tipo:p.new.tipo})
+        );
       })
       // ── Nuevo pedido asignado directo (sin pasar por asignaciones) ──
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'pedidos',filter:'delivery_id=eq.'+delId},p=>{
         cargarDatos(delId);
-        notifLocal('🔔 Nuevo Pedido',(p.new?.nombre_comercio||'—'));
       })
       // ── Cambios de tier/comisión del rider ──
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'perfiles'},()=>cargarDatos(delId))
@@ -3188,10 +3239,16 @@ function App(){
           <div onClick={e=>e.stopPropagation()} style={{position:'absolute',top:56,right:8,width:320,maxHeight:'70vh',background:'#1A1A1A',border:'1px solid #333',borderRadius:16,overflow:'hidden',boxShadow:'0 8px 32px rgba(0,0,0,.6)',display:'flex',flexDirection:'column'}}>
             <div style={{padding:'12px 14px',borderBottom:'1px solid #333',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
               <div style={{fontSize:13,fontWeight:700}}>🔔 Notificaciones</div>
-              <button onClick={async()=>{
-                await sb.from('notificaciones_delivery').update({leida:true}).eq('delivery_id',delivery.id).eq('leida',false);
-                setNotifs(n=>n.map(x=>({...x,leida:true})));
-              }} style={{background:'none',border:'none',color:'#FF8C00',fontSize:11,fontWeight:700,cursor:'pointer'}}>Limpiar todas</button>
+              <div style={{display:'flex',gap:12,alignItems:'center'}}>
+                <button onClick={()=>setSonidoOn(toggleSonido())} title={sonidoOn?'Sonido activado':'Sonido silenciado'}
+                  style={{background:'none',border:'none',fontSize:15,cursor:'pointer',opacity:sonidoOn?1:.45,padding:0}}>
+                  {sonidoOn?'🔊':'🔇'}
+                </button>
+                <button onClick={async()=>{
+                  await sb.from('notificaciones_delivery').update({leida:true}).eq('delivery_id',delivery.id).eq('leida',false);
+                  setNotifs(n=>n.map(x=>({...x,leida:true})));
+                }} style={{background:'none',border:'none',color:'#FF8C00',fontSize:11,fontWeight:700,cursor:'pointer'}}>Limpiar todas</button>
+              </div>
             </div>
             <div style={{overflowY:'auto',flex:1}}>
               {notifs.length===0&&<div style={{padding:20,textAlign:'center',fontSize:12,color:'#555'}}>Sin notificaciones</div>}
